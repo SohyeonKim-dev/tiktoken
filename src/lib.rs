@@ -13,38 +13,64 @@ use pyo3::PyResult;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 use rustc_hash::FxHashMap as HashMap;
 
-type Rank = u32;
+type Rank = u32; // unsigned 32 bit 정수를 의미한다
+
+// 분석할 함수 - 실질적인 토큰화가 동작하는 부분
+// input - 병합 규칙 HashMap이랑 piece - 우리가 병합할, 토큰화 할 bytes 
+// output - 시작 위치(usize type)와 Rank(Priority)가 묶인 벡터(집합)을 반환한다.
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
-    // This is a vector of (start, rank).
-    // The rank is of the pair starting at position start.
+    
+    // This is a vector of (start, rank). The rank is of the pair starting at position start. 
+    // 각 토큰의 시작 위치와, rank 즉 priority의 벡터가 parts라는 뜻 
+    // 값을 변경할 수 있는 변수 선언을 의미 = mutable
+
     let mut parts = Vec::with_capacity(piece.len() + 1);
 
     // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
     // the way we currently do, this is equivalent. An easy way to break this would be to decouple
-    // merge priority from token index or to prevent specific token merges.
-    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
-    for i in 0..piece.len() - 1 {
+    // merge priority from token index or to prevent specific token merges. - 머지에 우선순위가 있다 -> min_rank 정의 
+
+    // 병합 가능한 쌍 중 가장 priority가 높은, rank가 작은 pair를 의미한다. 
+    // min_rank = (rank, 토큰의 시작위치 i = usize type)
+    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX); 
+    
+    for i in 0..piece.len() - 1 {  // piece 끝까지 돌면서
         let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
-        if rank < min_rank.0 {
-            min_rank = (rank, i);
+        // piece에서 i, i+1 이렇게 두 바이트 쌍을 꺼내옴
+        // ranks 해쉬맵에서, get method를 통해 키를 제공하여, 값을 꺼내온다. 
+        // 출처: https://rinthel.github.io/rust-lang-book-ko/ch08-03-hash-maps.html
+        // 두 바이트 쌍이 해쉬맵에 없다면 (매칭이 안된다면) -> Rank::MAX를 rank로 가져오기 (let = immutable)
+
+        if rank < min_rank.0 { // 현재 가장 작은 병합쌍의 rank를 의미
+            min_rank = (rank, i); // min_rank의 rank와 i - 위치를 현재 index로 update
         }
-        parts.push((i, rank));
+
+        parts.push((i, rank)); // 현재 상태에서 토큰의 시작 위치 i and rank를 parts에 추가 
     }
+
+    // 끝부분 처리를 rank MAX (우선순위가 가장 낮다는 뜻)로 추가한다. 
     parts.push((piece.len() - 1, Rank::MAX));
     parts.push((piece.len(), Rank::MAX));
 
+    // 현재 piece의 처음부터 끝까지 훑으며, parts에 rank와 시작점을 저장한 상황 
+
+    // 클로저 정의
     let get_rank = {
-        #[inline(always)]
-        |parts: &Vec<(usize, Rank)>, i: usize| {
-            if (i + 3) < parts.len() {
+        #[inline(always)] // strongly suggests that the function should be inlined. 
+        |parts: &Vec<(usize, Rank)>, i: usize| { // input이 parts와 i 
+            if (i + 3) < parts.len() { // parts의 길이를 넘지 않았다면, 이런 의미
                 // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
                 // parts[i + 1], see comment in the main loop.
-                *ranks
+
+                // output이 ranks 
+                *ranks 
                     .get(&piece[parts[i].0..parts[i + 3].0])
                     .unwrap_or(&Rank::MAX)
+                    // parts[i].0 부터 parts[i + 3].0 까지 두 바이트 pair를 piece에서 잘라옴 
+                    // -> 즉, 이게 key 값이 되어 ranks에서 rank 값, 즉 우선순위를 가져온다는 뜻 (해시맵에서 get)
             } else {
-                Rank::MAX
+                Rank::MAX 
             }
         }
     };
@@ -53,26 +79,39 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
     // We could do something with a heap and do O(m log n) work.
     // n is often very small so considerations like cache-locality outweigh the algorithmic
     // complexity downsides of the `parts` vector.
+
     while min_rank.0 != Rank::MAX {
-        let i = min_rank.1;
+        let i = min_rank.1; 
+        // i = 토큰의 시작 위치 의미 
+        // 현재 가장 우선순위가 높은, 즉 rank가 최소인 pair를 가져와서 머지
+
         // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
         // `parts.remove(i + 1)` will thrash the cache.
+        // parts = (i, rank) 형식
+
+        // ** 이해 안되는 부분.! (i-1, i, i+1 그리고 remove?)
         if i > 0 {
-            parts[i - 1].1 = get_rank(&parts, i - 1);
+            parts[i - 1].1 = get_rank(&parts, i - 1); 
         }
         parts[i].1 = get_rank(&parts, i);
         parts.remove(i + 1);
 
-        min_rank = (Rank::MAX, usize::MAX);
+        // min_rank를 초기화 - 다시 MAX 상태로 업데이트한다. 
+        min_rank = (Rank::MAX, usize::MAX); 
+
         for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
             if rank < min_rank.0 {
                 min_rank = (rank, i);
             }
         }
     }
+
+    // 반환값 즉 output이 parts  
+    // 시작 위치(usize type)와 Rank(Priority)가 묶인 벡터(들의 집합)
     parts
 }
 
+// _byte_pair_merge 호출부 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
     assert!(piece.len() > 1);
     _byte_pair_merge(&ranks, &piece)
@@ -83,7 +122,7 @@ pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Ran
 
 pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
     assert!(piece.len() > 1);
-    _byte_pair_merge(&ranks, &piece)
+    (&ranks, &piece)
         .windows(2)
         .map(|part| &piece[part[0].0..part[1].0])
         .collect()
